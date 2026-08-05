@@ -45,33 +45,12 @@ func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing url parameter", http.StatusBadRequest)
 		return
 	}
-	s.logger.Info(
-		"shortening URL",
-		"user", user,
-		"url", longURL,
-	)
 	u, err := url.Parse(longURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		s.logger.Info(
-			"invalid URL format",
-			"url", longURL,
-			"error", err,
-		)
 		http.Error(w, "invalid URL: must include scheme (http/https) and host", http.StatusBadRequest)
 		return
 	}
-	s.logger.Info(
-		"parsed URL",
-		"scheme", u.Scheme,
-		"host", u.Host,
-		"path", u.Path,
-	)
 	if err := checkDestination(longURL); err != nil {
-		s.logger.Info(
-			"destination check failed",
-			"url", longURL,
-			"error", err,
-		)
 		http.Error(w, fmt.Sprintf("invalid target URL: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -87,7 +66,7 @@ func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info(
-		"generated short code",
+		"Successfully generated short code",
 		"short_code", shortCode,
 		"url", longURL,
 		"user", user,

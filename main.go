@@ -13,8 +13,49 @@ import (
 	"syscall"
 	"time"
 
+	 pkgerr "github.com/pkg/errors"
 	"boot.dev/linko/internal/store"
+	"boot.dev/linko/internal/linkoerr"
+
 )
+
+// multiError interface for joining multiple errors
+type multiError interface {
+	error
+	Unwrap() []error
+}
+
+type stackTracer interface {
+	error
+	StackTrace() pkgerr.StackTrace
+}
+
+// errorAttrs builds structured attributes from an error
+func errorAttrs(err error) []slog.Attr {
+    attrs := []slog.Attr{
+        slog.String("message", err.Error()),
+    }
+
+    // Add linkoerr attributes
+    if extra := linkoerr.Attrs(err); len(extra) > 0 {
+        for i := 0; i < len(extra); i += 2 {
+            if i+1 < len(extra) {
+                key, ok := extra[i].(string)
+                if !ok {
+                    continue
+                }
+                attrs = append(attrs, slog.Any(key, extra[i+1]))
+            }
+        }
+    }
+
+    // Add stack trace if available
+    if stacker, ok := err.(interface{ StackTrace() pkgerr.StackTrace }); ok {
+        attrs = append(attrs, slog.String("stack_trace", fmt.Sprintf("%+v", stacker.StackTrace())))
+    }
+
+    return attrs
+}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -50,12 +91,36 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 	var closers []io.Closer
 	var handlers []slog.Handler
 
+	replaceAttr := func(groups []string, a slog.Attr) slog.Attr {
+    if a.Key == "error" {
+        if err, ok := a.Value.Any().(error); ok {
+            if multiErr, ok := err.(multiError); ok {
+                subErrs := multiErr.Unwrap()
+                groupedAttrs := []slog.Attr{} // ← renamed from errorAttrs
+                for i, subErr := range subErrs {
+                    if subErr != nil {
+                        key := fmt.Sprintf("error_%d", i+1)
+                        subAttrs := errorAttrs(subErr) // ← now calls the function
+                        groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
+                    }
+                }
+                return slog.GroupAttrs("errors", groupedAttrs...)
+            }
+
+            attrs := errorAttrs(err)
+            return slog.GroupAttrs("error", attrs...)
+        }
+    }
+    return a
+}
+
 	// ----- STDOUT/STDERR handler: text, DEBUG and above -----
 	stderrBuf := bufio.NewWriterSize(os.Stderr, 8192)
 	buffers = append(buffers, stderrBuf)
 
 	stderrHandler := slog.NewTextHandler(stderrBuf, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level:       slog.LevelDebug,
+		ReplaceAttr: replaceAttr,
 	})
 	handlers = append(handlers, stderrHandler)
 
@@ -70,7 +135,8 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 		closers = append(closers, file)
 
 		fileHandler := slog.NewJSONHandler(fileBuf, &slog.HandlerOptions{
-			Level: slog.LevelInfo, // Only INFO and above go to the file
+			Level:       slog.LevelInfo,
+			ReplaceAttr: replaceAttr,
 		})
 		handlers = append(handlers, fileHandler)
 	}

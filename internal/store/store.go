@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"fmt"
-	"log/slog"          // changed from "log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"boot.dev/linko/internal/linkoerr"
 )
 
 type ShortURL struct {
@@ -29,10 +30,9 @@ const (
 
 type Store struct {
 	dir    string
-	logger *slog.Logger // changed to slog.Logger
+	logger *slog.Logger
 }
 
-// New now accepts a *slog.Logger
 func New(dir string, logger *slog.Logger) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -43,6 +43,7 @@ func New(dir string, logger *slog.Logger) (*Store, error) {
 	}, nil
 }
 
+// Create stores a long URL and returns a short code.
 func (s *Store) Create(_ context.Context, long string) (string, error) {
 	const retries = 10
 	const shortCodeLen = 6
@@ -72,14 +73,19 @@ func (s *Store) List(ctx context.Context) ([]ShortURL, error) {
 	ch := make(chan ShortURL)
 	go s.walk(ctx, ch)
 	var urls []ShortURL
+	var errs []error
 	for e := range ch {
 		if e.Err != nil {
-			return urls, e.Err
+			errs = append(errs, e.Err)
+			continue
 		}
 		urls = append(urls, e)
 		if len(urls) >= maxURLs {
 			break
 		}
+	}
+	if len(errs) > 0 {
+		return urls, errors.Join(errs...)
 	}
 	return urls, nil
 }
@@ -94,7 +100,11 @@ func (s *Store) walk(ctx context.Context, ch chan<- ShortURL) {
 		if !e.IsDir() {
 			long, err := s.Lookup(ctx, e.Name())
 			if err != nil {
-				ch <- ShortURL{Err: fmt.Errorf("read %s: %w", filepath.Join(s.dir, e.Name()), err)}
+				ch <- ShortURL{
+					Err: linkoerr.WithAttrs(err,
+						"path", filepath.Join(s.dir, e.Name()),
+					),
+				}
 				continue
 			}
 			ch <- ShortURL{ShortCode: e.Name(), LongURL: long}
@@ -110,11 +120,6 @@ func (s *Store) Lookup(_ context.Context, short string) (string, error) {
 		return "", ErrNotFound
 	}
 	if err != nil {
-		s.logger.Error(
-			"failed to read shortcode file",
-			"path", shortcodeFilepath,
-			"error", err,
-		)
 		return "", err
 	}
 	return string(data), nil

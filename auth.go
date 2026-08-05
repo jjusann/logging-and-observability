@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	pkgerr "github.com/pkg/errors"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -38,7 +39,6 @@ func (s *server) authMiddleware(next http.Handler) http.Handler {
 		}
 		ok, err := s.validatePassword(username, password, stored)
 		if err != nil {
-			// Log the error once here, with context
 			s.logger.Error(
 				"error validating password",
 				"user", username,
@@ -72,8 +72,7 @@ func (s *server) validatePassword(username, password, stored string) (bool, erro
 		return false, nil
 	}
 	if err != nil {
-		// Log is removed here – it's handled in the middleware with user context
-		return false, err
+		return false, pkgerr.WithStack(err)
 	}
 	return true, nil
 }
