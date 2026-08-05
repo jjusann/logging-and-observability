@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 
 	"golang.org/x/crypto/bcrypt"
@@ -29,31 +28,51 @@ func (s *server) authMiddleware(next http.Handler) http.Handler {
 		}
 		stored, exists := allowedUsers[username]
 		if !exists {
+			s.logger.Info(
+				"login attempt with unknown user",
+				"user", username,
+				"client_ip", r.RemoteAddr,
+			)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		ok, err := s.validatePassword(password, stored)
+		ok, err := s.validatePassword(username, password, stored)
 		if err != nil {
-			fmt.Printf("error validating password for user: %s, error: %v\n", username, err)
+			// Log the error once here, with context
+			s.logger.Error(
+				"error validating password",
+				"user", username,
+				"error", err,
+			)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 		if !ok {
+			s.logger.Info(
+				"invalid credentials",
+				"user", username,
+				"client_ip", r.RemoteAddr,
+			)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.logger.Info(
+			"user authenticated",
+			"user", username,
+			"client_ip", r.RemoteAddr,
+		)
 		r = r.WithContext(context.WithValue(r.Context(), UserContextKey, username))
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (s *server) validatePassword(password, stored string) (bool, error) {
+func (s *server) validatePassword(username, password, stored string) (bool, error) {
 	err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(password))
 	if err == bcrypt.ErrMismatchedHashAndPassword {
 		return false, nil
 	}
 	if err != nil {
-		fmt.Printf("error validating password: %v\n", err)
+		// Log is removed here – it's handled in the middleware with user context
 		return false, err
 	}
 	return true, nil

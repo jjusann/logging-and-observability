@@ -45,41 +45,85 @@ func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing url parameter", http.StatusBadRequest)
 		return
 	}
-	fmt.Println("Shortening URL:", longURL)
+	s.logger.Info(
+		"shortening URL",
+		"user", user,
+		"url", longURL,
+	)
 	u, err := url.Parse(longURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
+		s.logger.Info(
+			"invalid URL format",
+			"url", longURL,
+			"error", err,
+		)
 		http.Error(w, "invalid URL: must include scheme (http/https) and host", http.StatusBadRequest)
 		return
 	}
-	fmt.Printf("Parsed URL: scheme=%s, host=%s\n", u.Scheme, u.Host)
+	s.logger.Info(
+		"parsed URL",
+		"scheme", u.Scheme,
+		"host", u.Host,
+		"path", u.Path,
+	)
 	if err := checkDestination(longURL); err != nil {
+		s.logger.Info(
+			"destination check failed",
+			"url", longURL,
+			"error", err,
+		)
 		http.Error(w, fmt.Sprintf("invalid target URL: %v", err), http.StatusBadRequest)
 		return
 	}
 	shortCode, err := s.store.Create(r.Context(), longURL)
 	if err != nil {
+		s.logger.Error(
+			"failed to create short URL",
+			"user", user,
+			"url", longURL,
+			"error", err,
+		)
 		http.Error(w, "failed to shorten URL", http.StatusInternalServerError)
 		return
 	}
-	fmt.Printf("Generated short code: %s for URL: %s\n", shortCode, longURL)
+	s.logger.Info(
+		"generated short code",
+		"short_code", shortCode,
+		"url", longURL,
+		"user", user,
+	)
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusCreated)
 	io.WriteString(w, shortCode)
 }
 
 func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
-	longURL, err := s.store.Lookup(r.Context(), r.PathValue("shortCode"))
+	shortCode := r.PathValue("shortCode")
+	longURL, err := s.store.Lookup(r.Context(), shortCode)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			s.logger.Info(
+				"short code not found",
+				"short_code", shortCode,
+			)
 			http.Error(w, "not found", http.StatusNotFound)
 		} else {
-			fmt.Printf("failed to lookup URL: %v\n", err)
+			s.logger.Error(
+				"failed to lookup URL",
+				"short_code", shortCode,
+				"error", err,
+			)
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 		return
 	}
 	_, _ = bcrypt.GenerateFromPassword([]byte(longURL), bcrypt.DefaultCost)
 	if err := checkDestination(longURL); err != nil {
+		s.logger.Warn(
+			"destination unavailable",
+			"url", longURL,
+			"error", err,
+		)
 		http.Error(w, "destination unavailable", http.StatusBadGateway)
 		return
 	}
@@ -88,13 +132,22 @@ func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
 	redirects = append(redirects, strings.Repeat(longURL, 1024))
 	redirectsMu.Unlock()
 
+	s.logger.Info(
+		"redirecting",
+		"short_code", shortCode,
+		"destination", longURL,
+		"client_ip", r.RemoteAddr,
+	)
 	http.Redirect(w, r, longURL, http.StatusFound)
 }
 
 func (s *server) handlerListURLs(w http.ResponseWriter, r *http.Request) {
 	codes, err := s.store.List(r.Context())
 	if err != nil {
-		fmt.Printf("failed to list URLs: %v\n", err)
+		s.logger.Error(
+			"failed to list URLs",
+			"error", err,
+		)
 		http.Error(w, "failed to list URLs", http.StatusInternalServerError)
 		return
 	}
@@ -112,6 +165,12 @@ func (s *server) handlerStats(w http.ResponseWriter, _ *http.Request) {
 	for _, u := range snapshot {
 		bytesSaved += len(u) - shortURLLen
 	}
+
+	s.logger.Info(
+		"stats requested",
+		"redirects", len(snapshot),
+		"bytes_saved", bytesSaved,
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int{
