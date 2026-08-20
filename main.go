@@ -13,12 +13,41 @@ import (
 	"syscall"
 	"time"
 
-	 pkgerr "github.com/pkg/errors"
-	"boot.dev/linko/internal/store"
+	"boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/linkoerr"
-
+	"boot.dev/linko/internal/store"
+	pkgerr "github.com/pkg/errors"
 )
 
+
+// spyResponseWriter wraps http.ResponseWriter to capture the status code and response size.
+type spyResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	bytesWritten       int
+}
+// WriteHeader captures the status code written to the response.
+func (s *spyResponseWriter) WriteHeader(code int) {
+	s.statusCode = code 
+	s.ResponseWriter.WriteHeader(code) 
+}
+// Write captures the number of bytes written to the response.
+func (s *spyResponseWriter) Write(b []byte) (int, error) {
+	n, err := s.ResponseWriter.Write(b) 
+	s.bytesWritten += n 
+	return n, err 
+}
+
+type spyReadCloser struct {
+	io.ReadCloser
+	bytesRead int
+}
+
+func (s *spyReadCloser) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	s.bytesRead += n
+	return n, err
+}
 // multiError interface for joining multiple errors
 type multiError interface {
 	error
@@ -32,12 +61,12 @@ type stackTracer interface {
 
 // errorAttrs builds structured attributes from an error
 func errorAttrs(err error) []slog.Attr {
-    attrs := []slog.Attr{
+    attrs := []slog.Attr{ 
         slog.String("message", err.Error()),
     }
 
     // Add linkoerr attributes
-    if extra := linkoerr.Attrs(err); len(extra) > 0 {
+    if extra := linkoerr.Attrs(err); len(extra) > 0 { 
         for i := 0; i < len(extra); i += 2 {
             if i+1 < len(extra) {
                 key, ok := extra[i].(string)
@@ -71,17 +100,39 @@ func main() {
 
 // requestLogger middleware for slog
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next.ServeHTTP(w, r)
-			logger.Info(
-				"Served request",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"client_ip", r.RemoteAddr,
-			)
-		})
-	}
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            start := time.Now()
+
+            // Wrap response writer
+            sw := &spyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+            // Wrap request body (if present)
+            var bodyReader *spyReadCloser
+            if r.Body != nil {
+                bodyReader = &spyReadCloser{ReadCloser: r.Body}
+                r.Body = bodyReader
+            }
+
+            next.ServeHTTP(sw, r)
+
+            duration := time.Since(start)
+            requestBodyBytes := 0
+            if bodyReader != nil {
+                requestBodyBytes = bodyReader.bytesRead
+            }
+
+            logger.Info(
+                "Served request",
+                "method", r.Method,
+                "path", r.URL.Path,
+                "client_ip", r.RemoteAddr,
+                "duration", duration.String(),
+                "request_body_bytes", requestBodyBytes,
+                "response_status", sw.statusCode,
+                "response_body_bytes", sw.bytesWritten,
+            )
+        })
+    }
 }
 
 type closeFunc func() error
@@ -160,6 +211,18 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 		return nil
 	}
 
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "development"
+	}
+	hostname, _ := os.Hostname()
+
+	logger = logger.With(
+		slog.String("git_sha", build.GitSHA),
+		slog.String("build_time", build.BuildTime),
+		slog.String("env", env),
+		slog.String("hostname", hostname),
+	)
 	return logger, closeFn, nil
 }
 
