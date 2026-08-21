@@ -22,9 +22,12 @@ type server struct {
 func newServer(store store.Store, port int, cancel context.CancelFunc, logger *slog.Logger) *server {
 	mux := http.NewServeMux()
 
+	handler := requestIDMiddleware(requestLogger(logger)(mux))
+
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: requestLogger(logger)(mux), // wrap with access logger
+		Handler: handler,
 	}
 
 	s := &server{

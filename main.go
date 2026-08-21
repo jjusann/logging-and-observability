@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,25 +20,44 @@ import (
 	"boot.dev/linko/internal/linkoerr"
 	"boot.dev/linko/internal/store"
 	pkgerr "github.com/pkg/errors"
+	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
 )
 
+func generateRequestID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
-// spyResponseWriter wraps http.ResponseWriter to capture the status code and response size.
+type contextKey string
+
+const (
+	UserContextKey contextKey = "user"
+	LogContextKey  contextKey = "log_context"
+)
+
+type LogContext struct {
+	Username  string
+	Error     error
+	RequestID string
+}
+
 type spyResponseWriter struct {
 	http.ResponseWriter
-	statusCode int
-	bytesWritten       int
+	statusCode   int
+	bytesWritten int
 }
-// WriteHeader captures the status code written to the response.
+
 func (s *spyResponseWriter) WriteHeader(code int) {
-	s.statusCode = code 
-	s.ResponseWriter.WriteHeader(code) 
+	s.statusCode = code
+	s.ResponseWriter.WriteHeader(code)
 }
-// Write captures the number of bytes written to the response.
+
 func (s *spyResponseWriter) Write(b []byte) (int, error) {
-	n, err := s.ResponseWriter.Write(b) 
-	s.bytesWritten += n 
-	return n, err 
+	n, err := s.ResponseWriter.Write(b)
+	s.bytesWritten += n
+	return n, err
 }
 
 type spyReadCloser struct {
@@ -48,7 +70,14 @@ func (s *spyReadCloser) Read(p []byte) (int, error) {
 	s.bytesRead += n
 	return n, err
 }
-// multiError interface for joining multiple errors
+
+func httpError(ctx context.Context, w http.ResponseWriter, status int, err error) {
+	if logCtx, ok := ctx.Value(LogContextKey).(*LogContext); ok && err != nil {
+		logCtx.Error = err
+	}
+	http.Error(w, strings.ToLower(http.StatusText(status)), status)
+}
+
 type multiError interface {
 	error
 	Unwrap() []error
@@ -59,31 +88,38 @@ type stackTracer interface {
 	StackTrace() pkgerr.StackTrace
 }
 
-// errorAttrs builds structured attributes from an error
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = generateRequestID()
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		ctx := context.WithValue(r.Context(), LogContextKey, &LogContext{RequestID: requestID})
+		r = r.WithContext(ctx)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func errorAttrs(err error) []slog.Attr {
-    attrs := []slog.Attr{ 
-        slog.String("message", err.Error()),
-    }
-
-    // Add linkoerr attributes
-    if extra := linkoerr.Attrs(err); len(extra) > 0 { 
-        for i := 0; i < len(extra); i += 2 {
-            if i+1 < len(extra) {
-                key, ok := extra[i].(string)
-                if !ok {
-                    continue
-                }
-                attrs = append(attrs, slog.Any(key, extra[i+1]))
-            }
-        }
-    }
-
-    // Add stack trace if available
-    if stacker, ok := err.(interface{ StackTrace() pkgerr.StackTrace }); ok {
-        attrs = append(attrs, slog.String("stack_trace", fmt.Sprintf("%+v", stacker.StackTrace())))
-    }
-
-    return attrs
+	attrs := []slog.Attr{
+		slog.String("message", err.Error()),
+	}
+	if extra := linkoerr.Attrs(err); len(extra) > 0 {
+		for i := 0; i < len(extra); i += 2 {
+			if i+1 < len(extra) {
+				key, ok := extra[i].(string)
+				if !ok {
+					continue
+				}
+				attrs = append(attrs, slog.Any(key, extra[i+1]))
+			}
+		}
+	}
+	if stacker, ok := err.(interface{ StackTrace() pkgerr.StackTrace }); ok {
+		attrs = append(attrs, slog.String("stack_trace", fmt.Sprintf("%+v", stacker.StackTrace())))
+	}
+	return attrs
 }
 
 func main() {
@@ -98,41 +134,54 @@ func main() {
 	os.Exit(status)
 }
 
-// requestLogger middleware for slog
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            start := time.Now()
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
 
-            // Wrap response writer
-            sw := &spyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-            // Wrap request body (if present)
-            var bodyReader *spyReadCloser
-            if r.Body != nil {
-                bodyReader = &spyReadCloser{ReadCloser: r.Body}
-                r.Body = bodyReader
-            }
+			logCtx, ok := r.Context().Value(LogContextKey).(*LogContext)
+			if !ok {
+				logCtx = &LogContext{}
+			}
 
-            next.ServeHTTP(sw, r)
+			sw := &spyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			var bodyReader *spyReadCloser
+			if r.Body != nil {
+				bodyReader = &spyReadCloser{ReadCloser: r.Body}
+				r.Body = bodyReader
+			}
 
-            duration := time.Since(start)
-            requestBodyBytes := 0
-            if bodyReader != nil {
-                requestBodyBytes = bodyReader.bytesRead
-            }
+			next.ServeHTTP(sw, r)
 
-            logger.Info(
-                "Served request",
-                "method", r.Method,
-                "path", r.URL.Path,
-                "client_ip", r.RemoteAddr,
-                "duration", duration.String(),
-                "request_body_bytes", requestBodyBytes,
-                "response_status", sw.statusCode,
-                "response_body_bytes", sw.bytesWritten,
-            )
-        })
-    }
+			duration := time.Since(start)
+			requestBodyBytes := 0
+			if bodyReader != nil {
+				requestBodyBytes = bodyReader.bytesRead
+			}
+
+			attrs := []any{
+				"method", r.Method,
+				"path", r.URL.Path,
+				"client_ip", r.RemoteAddr,
+				"duration", duration.String(),
+				"request_body_bytes", requestBodyBytes,
+				"response_status", sw.statusCode,
+				"response_body_bytes", sw.bytesWritten,
+			}
+
+			if logCtx.RequestID != "" {
+				attrs = append(attrs, "request_id", logCtx.RequestID)
+			}
+			if logCtx.Username != "" {
+				attrs = append(attrs, "user", logCtx.Username)
+			}
+			if logCtx.Error != nil {
+				attrs = append(attrs, "error", logCtx.Error)
+			}
+
+			logger.Info("Served request", attrs...)
+		})
+	}
 }
 
 type closeFunc func() error
@@ -142,36 +191,60 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 	var closers []io.Closer
 	var handlers []slog.Handler
 
-	replaceAttr := func(groups []string, a slog.Attr) slog.Attr {
-    if a.Key == "error" {
-        if err, ok := a.Value.Any().(error); ok {
-            if multiErr, ok := err.(multiError); ok {
-                subErrs := multiErr.Unwrap()
-                groupedAttrs := []slog.Attr{} // ← renamed from errorAttrs
-                for i, subErr := range subErrs {
-                    if subErr != nil {
-                        key := fmt.Sprintf("error_%d", i+1)
-                        subAttrs := errorAttrs(subErr) // ← now calls the function
-                        groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
-                    }
-                }
-                return slog.GroupAttrs("errors", groupedAttrs...)
-            }
+	/* replaceAttr := func(groups []string, a slog.Attr) slog.Attr {
+		if a.Key == "error" {
+			if err, ok := a.Value.Any().(error); ok {
+				if multiErr, ok := err.(multiError); ok {
+					subErrs := multiErr.Unwrap()
+					groupedAttrs := []slog.Attr{}
+					for i, subErr := range subErrs {
+						if subErr != nil {
+							key := fmt.Sprintf("error_%d", i+1)
+							subAttrs := errorAttrs(subErr)
+							groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
+						}
+					}
+					return slog.GroupAttrs("errors", groupedAttrs...)
+				}
+				attrs := errorAttrs(err)
+				return slog.GroupAttrs("error", attrs...)
+			}
+		}
+		return a
+	} */
 
-            attrs := errorAttrs(err)
-            return slog.GroupAttrs("error", attrs...)
-        }
-    }
-    return a
-}
-
-	// ----- STDOUT/STDERR handler: text, DEBUG and above -----
+	// ----- STDOUT/STDERR handler: COLORED text, DEBUG and above -----
 	stderrBuf := bufio.NewWriterSize(os.Stderr, 8192)
 	buffers = append(buffers, stderrBuf)
 
-	stderrHandler := slog.NewTextHandler(stderrBuf, &slog.HandlerOptions{
-		Level:       slog.LevelDebug,
-		ReplaceAttr: replaceAttr,
+	// Check if we're in a TTY
+	isTTY := isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())
+
+	stderrHandler := tint.NewHandler(stderrBuf, &tint.Options{
+		Level:   slog.LevelDebug,
+		NoColor: !isTTY, // Disable colors if not a TTY
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// Keep the same replaceAttr logic (error grouping, stack traces)
+			if a.Key == "error" {
+				if err, ok := a.Value.Any().(error); ok {
+					if multiErr, ok := err.(multiError); ok {
+						subErrs := multiErr.Unwrap()
+						groupedAttrs := []slog.Attr{}
+						for i, subErr := range subErrs {
+							if subErr != nil {
+								key := fmt.Sprintf("error_%d", i+1)
+								subAttrs := errorAttrs(subErr)
+								groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
+							}
+						}
+						return slog.GroupAttrs("errors", groupedAttrs...)
+					}
+					attrs := errorAttrs(err)
+					return slog.GroupAttrs("error", attrs...)
+				}
+			}
+			return a
+		},
 	})
 	handlers = append(handlers, stderrHandler)
 
@@ -186,8 +259,29 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 		closers = append(closers, file)
 
 		fileHandler := slog.NewJSONHandler(fileBuf, &slog.HandlerOptions{
-			Level:       slog.LevelInfo,
-			ReplaceAttr: replaceAttr,
+			Level: slog.LevelInfo,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				// Reuse the same replaceAttr for JSON logs (no colors)
+				if a.Key == "error" {
+					if err, ok := a.Value.Any().(error); ok {
+						if multiErr, ok := err.(multiError); ok {
+							subErrs := multiErr.Unwrap()
+							groupedAttrs := []slog.Attr{}
+							for i, subErr := range subErrs {
+								if subErr != nil {
+									key := fmt.Sprintf("error_%d", i+1)
+									subAttrs := errorAttrs(subErr)
+									groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
+								}
+							}
+							return slog.GroupAttrs("errors", groupedAttrs...)
+						}
+						attrs := errorAttrs(err)
+						return slog.GroupAttrs("error", attrs...)
+					}
+				}
+				return a
+			},
 		})
 		handlers = append(handlers, fileHandler)
 	}
@@ -238,14 +332,12 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 		}
 	}()
 
-	// Initialize store with the logger
 	st, err := store.New(dataDir, logger)
 	if err != nil {
 		logger.Error(fmt.Sprintf("failed to create store: %v", err))
 		return 1
 	}
 
-	// Initialize server with the logger (pass cancel)
 	s := newServer(*st, httpPort, cancel, logger)
 
 	var serverErr error
@@ -254,7 +346,7 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 		serverErr = s.start()
 		if serverErr != nil {
 			logger.Error(fmt.Sprintf("server error: %v", serverErr))
-			s.cancel() // trigger shutdown via server's cancel
+			s.cancel()
 		}
 	}()
 

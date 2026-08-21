@@ -4,7 +4,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 
 	"boot.dev/linko/internal/store"
 	"golang.org/x/crypto/bcrypt"
+	pkgerr "github.com/pkg/errors"
 )
 
 const shortURLLen = len("http://localhost:8080/") + 6
@@ -37,21 +37,21 @@ func (s *server) handlerLogin(w http.ResponseWriter, r *http.Request) {
 func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 	user, ok := r.Context().Value(UserContextKey).(string)
 	if !ok || user == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		httpError(r.Context(), w, http.StatusUnauthorized, pkgerr.New("unauthorized"))
 		return
 	}
 	longURL := r.FormValue("url")
 	if longURL == "" {
-		http.Error(w, "missing url parameter", http.StatusBadRequest)
+		httpError(r.Context(), w, http.StatusBadRequest, pkgerr.New("missing url parameter"))
 		return
 	}
 	u, err := url.Parse(longURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		http.Error(w, "invalid URL: must include scheme (http/https) and host", http.StatusBadRequest)
+		httpError(r.Context(), w, http.StatusBadRequest, pkgerr.New("invalid URL: must include scheme (http/https) and host"))
 		return
 	}
 	if err := checkDestination(longURL); err != nil {
-		http.Error(w, fmt.Sprintf("invalid target URL: %v", err), http.StatusBadRequest)
+		httpError(r.Context(), w, http.StatusBadRequest, pkgerr.Wrap(err, "invalid target URL"))
 		return
 	}
 	shortCode, err := s.store.Create(r.Context(), longURL)
@@ -62,7 +62,7 @@ func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 			"url", longURL,
 			"error", err,
 		)
-		http.Error(w, "failed to shorten URL", http.StatusInternalServerError)
+		httpError(r.Context(), w, http.StatusInternalServerError, pkgerr.New("failed to shorten URL"))
 		return
 	}
 	s.logger.Info(
@@ -85,14 +85,14 @@ func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
 				"short code not found",
 				"short_code", shortCode,
 			)
-			http.Error(w, "not found", http.StatusNotFound)
+			httpError(r.Context(), w, http.StatusNotFound, pkgerr.New("not found"))
 		} else {
 			s.logger.Error(
 				"failed to lookup URL",
 				"short_code", shortCode,
 				"error", err,
 			)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
+			httpError(r.Context(), w, http.StatusInternalServerError, pkgerr.New("internal server error"))
 		}
 		return
 	}
@@ -103,7 +103,7 @@ func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
 			"url", longURL,
 			"error", err,
 		)
-		http.Error(w, "destination unavailable", http.StatusBadGateway)
+		httpError(r.Context(), w, http.StatusBadGateway, pkgerr.New("destination unavailable"))
 		return
 	}
 
@@ -127,7 +127,7 @@ func (s *server) handlerListURLs(w http.ResponseWriter, r *http.Request) {
 			"failed to list URLs",
 			"error", err,
 		)
-		http.Error(w, "failed to list URLs", http.StatusInternalServerError)
+		httpError(r.Context(), w, http.StatusInternalServerError, pkgerr.New("failed to list URLs"))
 		return
 	}
 
