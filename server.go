@@ -16,28 +16,17 @@ type server struct {
 	httpServer *http.Server
 	store      store.Store
 	cancel     context.CancelFunc
-	logger     *slog.Logger // injected logger (access logger)
+	logger     *slog.Logger
 }
 
 func newServer(store store.Store, port int, cancel context.CancelFunc, logger *slog.Logger) *server {
-	mux := http.NewServeMux()
-
-	handler := requestIDMiddleware(requestLogger(logger)(mux))
-
-
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: handler,
-	}
-
 	s := &server{
-		httpServer: srv,
-		store:      store,
-		cancel:     cancel,
-		logger:     logger,
+		store:  store,
+		cancel: cancel,
+		logger: logger,
 	}
 
-	// Set up routes
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handlerIndex)
 	mux.Handle("POST /api/login", s.authMiddleware(http.HandlerFunc(s.handlerLogin)))
 	mux.Handle("POST /api/shorten", s.authMiddleware(http.HandlerFunc(s.handlerShortenLink)))
@@ -46,11 +35,16 @@ func newServer(store store.Store, port int, cancel context.CancelFunc, logger *s
 	mux.HandleFunc("GET /{shortCode}", s.handlerRedirect)
 	mux.HandleFunc("POST /admin/shutdown", s.handlerShutdown)
 
+	handler := requestIDMiddleware(requestLogger(logger)(mux))
+	s.httpServer = &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: handler,
+	}
 	return s
 }
 
 func (s *server) start() error {
-	ln, err := net.Listen("tcp", s.httpServer.Addr)
+	ln, err := net.Listen("tcp4", s.httpServer.Addr)
 	if err != nil {
 		return err
 	}

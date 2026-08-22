@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,18 +12,51 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
+	"strings"
 	"time"
+	"net"
+
+	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
+	pkgerr "github.com/pkg/errors"
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	"boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/linkoerr"
 	"boot.dev/linko/internal/store"
-	pkgerr "github.com/pkg/errors"
-	"github.com/lmittmann/tint"
-	"github.com/mattn/go-isatty"
 )
 
+
+func redactIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port present — treat the whole string as the host.
+		host = addr
+	}
+
+	// Treat the IPv6 loopback as IPv4 loopback for local testing.
+	if host == "::1" {
+		host = "127.0.0.1"
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return addr
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		// Not an IPv4 address — return unchanged.
+		return addr
+	}
+
+	parts := strings.Split(ip4.String(), ".")
+	parts[3] = "x"
+	return strings.Join(parts, ".")
+}
+
+// Helpers
 func generateRequestID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -43,6 +76,7 @@ type LogContext struct {
 	RequestID string
 }
 
+// Spies
 type spyResponseWriter struct {
 	http.ResponseWriter
 	statusCode   int
@@ -72,20 +106,30 @@ func (s *spyReadCloser) Read(p []byte) (int, error) {
 }
 
 func httpError(ctx context.Context, w http.ResponseWriter, status int, err error) {
-	if logCtx, ok := ctx.Value(LogContextKey).(*LogContext); ok && err != nil {
-		logCtx.Error = err
-	}
-	http.Error(w, strings.ToLower(http.StatusText(status)), status)
-}
+    // Store the appropriate error in LogContext.
+    if logCtx, ok := ctx.Value(LogContextKey).(*LogContext); ok && err != nil {
+        // For 401, 403, 500, use the lowercase generic status text as the error message.
+        // The original error is already logged separately in handlers.
+        if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusInternalServerError {
+            logCtx.Error = pkgerr.New(strings.ToLower(http.StatusText(status)))
+        } else {
+            logCtx.Error = err
+        }
+    }
 
-type multiError interface {
-	error
-	Unwrap() []error
-}
-
-type stackTracer interface {
-	error
-	StackTrace() pkgerr.StackTrace
+    // Send the same message to the client.
+    var msg string
+    switch status {
+    case http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError:
+        msg = http.StatusText(status) // capitalized, e.g. "Unauthorized"
+    default:
+        if err != nil {
+            msg = err.Error()
+        } else {
+            msg = http.StatusText(status)
+        }
+    }
+    http.Error(w, msg, status)
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {
@@ -101,74 +145,35 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func errorAttrs(err error) []slog.Attr {
-	attrs := []slog.Attr{
-		slog.String("message", err.Error()),
-	}
-	if extra := linkoerr.Attrs(err); len(extra) > 0 {
-		for i := 0; i < len(extra); i += 2 {
-			if i+1 < len(extra) {
-				key, ok := extra[i].(string)
-				if !ok {
-					continue
-				}
-				attrs = append(attrs, slog.Any(key, extra[i+1]))
-			}
-		}
-	}
-	if stacker, ok := err.(interface{ StackTrace() pkgerr.StackTrace }); ok {
-		attrs = append(attrs, slog.String("stack_trace", fmt.Sprintf("%+v", stacker.StackTrace())))
-	}
-	return attrs
-}
-
-func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-
-	httpPort := flag.Int("port", 8899, "port to listen on")
-	dataDir := flag.String("data", "./data", "directory to store data")
-	flag.Parse()
-
-	status := run(ctx, cancel, *httpPort, *dataDir)
-	cancel()
-	os.Exit(status)
-}
-
 func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-
 			logCtx, ok := r.Context().Value(LogContextKey).(*LogContext)
 			if !ok {
 				logCtx = &LogContext{}
 			}
-
 			sw := &spyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 			var bodyReader *spyReadCloser
 			if r.Body != nil {
 				bodyReader = &spyReadCloser{ReadCloser: r.Body}
 				r.Body = bodyReader
 			}
-
 			next.ServeHTTP(sw, r)
-
 			duration := time.Since(start)
 			requestBodyBytes := 0
 			if bodyReader != nil {
 				requestBodyBytes = bodyReader.bytesRead
 			}
-
 			attrs := []any{
 				"method", r.Method,
 				"path", r.URL.Path,
-				"client_ip", r.RemoteAddr,
+				"client_ip", redactIP(r.RemoteAddr),
 				"duration", duration.String(),
 				"request_body_bytes", requestBodyBytes,
 				"response_status", sw.statusCode,
 				"response_body_bytes", sw.bytesWritten,
 			}
-
 			if logCtx.RequestID != "" {
 				attrs = append(attrs, "request_id", logCtx.RequestID)
 			}
@@ -178,159 +183,40 @@ func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			if logCtx.Error != nil {
 				attrs = append(attrs, "error", logCtx.Error)
 			}
-
 			logger.Info("Served request", attrs...)
 		})
 	}
 }
 
-type closeFunc func() error
-
-func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
-	var buffers []*bufio.Writer
-	var closers []io.Closer
-	var handlers []slog.Handler
-
-	/* replaceAttr := func(groups []string, a slog.Attr) slog.Attr {
-		if a.Key == "error" {
-			if err, ok := a.Value.Any().(error); ok {
-				if multiErr, ok := err.(multiError); ok {
-					subErrs := multiErr.Unwrap()
-					groupedAttrs := []slog.Attr{}
-					for i, subErr := range subErrs {
-						if subErr != nil {
-							key := fmt.Sprintf("error_%d", i+1)
-							subAttrs := errorAttrs(subErr)
-							groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
-						}
-					}
-					return slog.GroupAttrs("errors", groupedAttrs...)
-				}
-				attrs := errorAttrs(err)
-				return slog.GroupAttrs("error", attrs...)
-			}
-		}
-		return a
-	} */
-
-	// ----- STDOUT/STDERR handler: COLORED text, DEBUG and above -----
-	stderrBuf := bufio.NewWriterSize(os.Stderr, 8192)
-	buffers = append(buffers, stderrBuf)
-
-	// Check if we're in a TTY
-	isTTY := isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())
-
-	stderrHandler := tint.NewHandler(stderrBuf, &tint.Options{
-		Level:   slog.LevelDebug,
-		NoColor: !isTTY, // Disable colors if not a TTY
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			// Keep the same replaceAttr logic (error grouping, stack traces)
-			if a.Key == "error" {
-				if err, ok := a.Value.Any().(error); ok {
-					if multiErr, ok := err.(multiError); ok {
-						subErrs := multiErr.Unwrap()
-						groupedAttrs := []slog.Attr{}
-						for i, subErr := range subErrs {
-							if subErr != nil {
-								key := fmt.Sprintf("error_%d", i+1)
-								subAttrs := errorAttrs(subErr)
-								groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
-							}
-						}
-						return slog.GroupAttrs("errors", groupedAttrs...)
-					}
-					attrs := errorAttrs(err)
-					return slog.GroupAttrs("error", attrs...)
-				}
-			}
-			return a
-		},
-	})
-	handlers = append(handlers, stderrHandler)
-
-	// ----- FILE handler: JSON, INFO and above -----
-	if logFile != "" {
-		file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open log file: %w", err)
-		}
-		fileBuf := bufio.NewWriterSize(file, 8192)
-		buffers = append(buffers, fileBuf)
-		closers = append(closers, file)
-
-		fileHandler := slog.NewJSONHandler(fileBuf, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
-			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-				// Reuse the same replaceAttr for JSON logs (no colors)
-				if a.Key == "error" {
-					if err, ok := a.Value.Any().(error); ok {
-						if multiErr, ok := err.(multiError); ok {
-							subErrs := multiErr.Unwrap()
-							groupedAttrs := []slog.Attr{}
-							for i, subErr := range subErrs {
-								if subErr != nil {
-									key := fmt.Sprintf("error_%d", i+1)
-									subAttrs := errorAttrs(subErr)
-									groupedAttrs = append(groupedAttrs, slog.GroupAttrs(key, subAttrs...))
-								}
-							}
-							return slog.GroupAttrs("errors", groupedAttrs...)
-						}
-						attrs := errorAttrs(err)
-						return slog.GroupAttrs("error", attrs...)
-					}
-				}
-				return a
-			},
-		})
-		handlers = append(handlers, fileHandler)
-	}
-
-	// Combine all handlers into one
-	multiHandler := slog.NewMultiHandler(handlers...)
-	logger := slog.New(multiHandler)
-
-	// Close function: flush all buffers and close files
-	closeFn := func() error {
-		for _, buf := range buffers {
-			if err := buf.Flush(); err != nil {
-				return fmt.Errorf("buffer flush: %w", err)
-			}
-		}
-		for _, c := range closers {
-			if err := c.Close(); err != nil {
-				return fmt.Errorf("file close: %w", err)
-			}
-		}
-		return nil
-	}
-
-	env := os.Getenv("ENV")
-	if env == "" {
-		env = "development"
-	}
-	hostname, _ := os.Hostname()
-
-	logger = logger.With(
-		slog.String("git_sha", build.GitSHA),
-		slog.String("build_time", build.BuildTime),
-		slog.String("env", env),
-		slog.String("hostname", hostname),
-	)
-	return logger, closeFn, nil
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	httpPort := flag.Int("port", 8899, "port to listen on")
+	dataDir := flag.String("data", "./data", "directory to store data")
+	flag.Parse()
+	status := run(ctx, cancel, *httpPort, *dataDir)
+	cancel()
+	os.Exit(status)
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
-	logger, closeFn, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
+	logger, closeLogger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
 		return 1
 	}
 	defer func() {
-		if err := closeFn(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to close logger: %v\n", err)
+		if err := closeLogger(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to close logger: %v\n", err)
 		}
 	}()
+
+	hostname, _ := os.Hostname()
+	logger = logger.With(
+		slog.String("git_sha", build.GitSHA),
+		slog.String("build_time", build.BuildTime),
+		slog.String("env", os.Getenv("ENV")),
+		slog.String("hostname", hostname),
+	)
 
 	st, err := store.New(dataDir, logger)
 	if err != nil {
@@ -339,29 +225,121 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 	}
 
 	s := newServer(*st, httpPort, cancel, logger)
-
 	var serverErr error
 	go func() {
-		logger.Debug(fmt.Sprintf("Linko is running on http://localhost:%d", httpPort))
 		serverErr = s.start()
-		if serverErr != nil {
-			logger.Error(fmt.Sprintf("server error: %v", serverErr))
-			s.cancel()
-		}
 	}()
 
 	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	logger.Debug("Linko is shutting down")
-
-	shutdownCtx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelTimeout()
-
 	if err := s.shutdown(shutdownCtx); err != nil {
 		logger.Error(fmt.Sprintf("failed to shutdown server: %v", err))
 		return 1
 	}
 	if serverErr != nil {
+		logger.Error(fmt.Sprintf("server error: %v", serverErr))
 		return 1
 	}
 	return 0
+}
+
+type closeFunc func() error
+
+func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
+	handlers := []slog.Handler{
+		tint.NewTextHandler(os.Stderr, &tint.Options{
+			Level:       slog.LevelDebug,
+			ReplaceAttr: replaceAttr,
+			NoColor:     !(isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())),
+		}),
+	}
+
+	closers := []closeFunc{}
+
+	if logFile != "" {
+		rotator := &lumberjack.Logger{
+			Filename:   logFile,
+			MaxSize:    1, // 1 MB for testing; set to 10 in production
+			MaxAge:     28,
+			MaxBackups: 10,
+			LocalTime:  false,
+			Compress:   true,
+		}
+		handlers = append(handlers, slog.NewJSONHandler(rotator, &slog.HandlerOptions{
+			Level:       slog.LevelInfo,
+			ReplaceAttr: replaceAttr,
+		}))
+		closers = append(closers, func() error {
+			if err := rotator.Close(); err != nil {
+				return fmt.Errorf("rotator close: %w", err)
+			}
+			return nil
+		})
+	}
+
+	closer := func() error {
+		var errs []error
+		for _, c := range closers {
+			if err := c(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
+
+	logger := slog.New(slog.NewMultiHandler(handlers...))
+	return logger, closer, nil
+}
+
+type stackTracer interface {
+	error
+	StackTrace() pkgerr.StackTrace
+}
+
+type multiError interface {
+	error
+	Unwrap() []error
+}
+
+func errorAttrs(err error) []slog.Attr {
+	attrs := []slog.Attr{
+		{Key: "message", Value: slog.StringValue(err.Error())},
+	}
+	extra := linkoerr.Attrs(err)
+	for i := 0; i < len(extra); i += 2 {
+		if i+1 < len(extra) {
+			key, ok := extra[i].(string)
+			if !ok {
+				continue
+			}
+			attrs = append(attrs, slog.Any(key, extra[i+1]))
+		}
+	}
+	if stackErr, ok := err.(stackTracer); ok {
+		attrs = append(attrs, slog.Attr{
+			Key:   "stack_trace",
+			Value: slog.StringValue(fmt.Sprintf("%+v", stackErr.StackTrace())),
+		})
+	}
+	return attrs
+}
+
+func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == "error" {
+		err, ok := a.Value.Any().(error)
+		if !ok {
+			return a
+		}
+		if multiErr, ok := err.(multiError); ok {
+			var errAttrs []slog.Attr
+			for i, e := range multiErr.Unwrap() {
+				errAttrs = append(errAttrs, slog.GroupAttrs(fmt.Sprintf("error_%d", i+1), errorAttrs(e)...))
+			}
+			return slog.GroupAttrs("errors", errAttrs...)
+		}
+		return slog.GroupAttrs("error", errorAttrs(err)...)
+	}
+	return a
 }
