@@ -10,6 +10,8 @@ import (
 	"os"
 
 	"boot.dev/linko/internal/store"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 )
 
 type server struct {
@@ -35,11 +37,14 @@ func newServer(store store.Store, port int, cancel context.CancelFunc, logger *s
 	mux.HandleFunc("GET /{shortCode}", s.handlerRedirect)
 	mux.HandleFunc("POST /admin/shutdown", s.handlerShutdown)
 
-	handler := requestIDMiddleware(requestLogger(logger)(mux))
+    handler := metricsMiddleware(requestIDMiddleware(requestLogger(logger)(mux)))
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 		Handler: handler,
 	}
+
+	mux.Handle("GET /metrics", promhttp.Handler())
+
 	return s
 }
 

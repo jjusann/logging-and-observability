@@ -59,7 +59,7 @@ func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error(
 			"failed to create short URL",
 			"user", user,
-			"url", longURL,
+			"long_url", longURL,
 			"error", err,
 		)
 		httpError(r.Context(), w, http.StatusInternalServerError, pkgerr.New("failed to shorten URL"))
@@ -68,7 +68,7 @@ func (s *server) handlerShortenLink(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info(
 		"Successfully generated short code",
 		"short_code", shortCode,
-		"url", longURL,
+		"long_url", longURL,
 		"user", user,
 	)
 	w.Header().Set("Content-Type", "text/plain")
@@ -100,7 +100,7 @@ func (s *server) handlerRedirect(w http.ResponseWriter, r *http.Request) {
 	if err := checkDestination(longURL); err != nil {
 		s.logger.Warn(
 			"destination unavailable",
-			"url", longURL,
+			"long_url", longURL,
 			"error", err,
 		)
 		httpError(r.Context(), w, http.StatusBadGateway, pkgerr.New("destination unavailable"))

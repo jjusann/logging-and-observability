@@ -16,6 +16,9 @@ import (
 	"strings"
 	"time"
 	"net"
+	"slices"
+	"net/url"
+	"strconv"
 
 	"github.com/lmittmann/tint"
 	"github.com/mattn/go-isatty"
@@ -25,8 +28,42 @@ import (
 	"boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/linkoerr"
 	"boot.dev/linko/internal/store"
+
+	"github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+var httpRequestsTotal = promauto.NewCounterVec(
+    prometheus.CounterOpts{
+        Name: "http_requests_total",
+        Help: "Total number of HTTP requests",
+    },
+    []string{"method", "path", "status"},
+)
+
+func metricsMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Wrap response writer to capture status code
+        sw := &spyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+        next.ServeHTTP(sw, r)
+        // Increment counter with labels
+        httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(sw.statusCode)).Inc()
+    })
+}
+
+func redactURLPassword(s string) string {
+    u, err := url.Parse(s)
+    if err != nil {
+        return s
+    }
+    if u.User == nil {
+        return s
+    }
+    username := u.User.Username()
+    // Rebuild with redacted password
+    u.User = url.UserPassword(username, "[REDACTED]")
+    return u.String()
+}
 
 func redactIP(addr string) string {
 	host, _, err := net.SplitHostPort(addr)
@@ -326,7 +363,31 @@ func errorAttrs(err error) []slog.Attr {
 	return attrs
 }
 
+var sensitiveKeys = []string{
+	"password",
+	"key",
+	"apikey",
+	"secret",
+	"pin",
+	"creditcardno",
+	"user",
+}
+
 func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	
+    // ----- Security filter: redact sensitive keys -----
+    if slices.Contains(sensitiveKeys, a.Key) {
+        return slog.Attr{Key: a.Key, Value: slog.StringValue("[REDACTED]")}
+    }
+
+    // ----- Redact passwords in URLs -----
+    if a.Value.Kind() == slog.KindString {
+        s := a.Value.String()
+        if redacted := redactURLPassword(s); redacted != s {
+            return slog.Attr{Key: a.Key, Value: slog.StringValue(redacted)}
+        }
+    }
+	
 	if a.Key == "error" {
 		err, ok := a.Value.Any().(error)
 		if !ok {
