@@ -17,58 +17,63 @@ var allowedUsers = map[string]string{
 }
 
 func (s *server) authMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        username, password, ok := r.BasicAuth()
-        if !ok {
-            httpError(r.Context(), w, http.StatusUnauthorized, pkgerr.New("basic auth required"))
-            return
-        }
-        stored, exists := allowedUsers[username]
-        if !exists {
-            s.logger.Info(
-                "login attempt with unknown user",
-                "user", username,
-                "client_ip", r.RemoteAddr,
-            )
-            httpError(r.Context(), w, http.StatusUnauthorized, pkgerr.New("invalid credentials"))
-            return
-        }
-        ok, err := s.validatePassword(username, password, stored)
-        if err != nil {
-            s.logger.Error(
-                "error validating password",
-                "user", username,
-                "error", err,
-            )
-            httpError(r.Context(), w, http.StatusInternalServerError, pkgerr.New("internal server error"))
-            return
-        }
-        if !ok {
-            s.logger.Info(
-                "invalid credentials",
-                "user", username,
-                "client_ip", r.RemoteAddr,
-            )
-            httpError(r.Context(), w, http.StatusUnauthorized, pkgerr.New("invalid credentials"))
-            return
-        }
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			httpError(ctx, w, http.StatusUnauthorized, pkgerr.New("basic auth required"))
+			return
+		}
+		stored, exists := allowedUsers[username]
+		if !exists {
+			s.logger.Info(
+				"login attempt with unknown user",
+				"user", username,
+				"client_ip", r.RemoteAddr,
+			)
+			httpError(ctx, w, http.StatusUnauthorized, pkgerr.New("invalid credentials"))
+			return
+		}
+		ok, err := s.validatePassword(ctx, username, password, stored)
+		if err != nil {
+			s.logger.Error(
+				"error validating password",
+				"user", username,
+				"error", err,
+			)
+			httpError(ctx, w, http.StatusInternalServerError, pkgerr.New("internal server error"))
+			return
+		}
+		if !ok {
+			s.logger.Info(
+				"invalid credentials",
+				"user", username,
+				"client_ip", r.RemoteAddr,
+			)
+			httpError(ctx, w, http.StatusUnauthorized, pkgerr.New("invalid credentials"))
+			return
+		}
 
-        // ✅ Set username in log context
-        if logCtx, ok := r.Context().Value(LogContextKey).(*LogContext); ok {
-            logCtx.Username = username
-        }
+		// Set username in log context
+		if logCtx, ok := ctx.Value(LogContextKey).(*LogContext); ok {
+			logCtx.Username = username
+		}
 
-        s.logger.Info(
-            "user authenticated",
-            "user", username,
-            "client_ip", r.RemoteAddr,
-        )
-        r = r.WithContext(context.WithValue(r.Context(), UserContextKey, username))
-        next.ServeHTTP(w, r)
-    })
+		s.logger.Info(
+			"user authenticated",
+			"user", username,
+			"client_ip", r.RemoteAddr,
+		)
+		r = r.WithContext(context.WithValue(ctx, UserContextKey, username))
+		next.ServeHTTP(w, r)
+	})
 }
 
-func (s *server) validatePassword(username, password, stored string) (bool, error) {
+// validatePassword now takes a context and creates a child span.
+func (s *server) validatePassword(ctx context.Context, username, password, stored string) (bool, error) {
+	_, span := tracer.Start(ctx, "auth.validate_password")
+	defer span.End()
+
 	err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(password))
 	if err == bcrypt.ErrMismatchedHashAndPassword {
 		return false, nil

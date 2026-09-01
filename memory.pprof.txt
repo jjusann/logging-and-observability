@@ -1,0 +1,51 @@
+File: linko
+Build ID: 6f58dee2d9a403dcf65d5a88deba7adef8666889
+Type: inuse_space
+Time: 2026-08-31 21:30:41 CEST
+Duration: 30.01s, Total samples = 6754.87kB 
+Showing nodes accounting for 5727.86kB, 84.80% of 6754.87kB total
+      flat  flat%   sum%        cum   cum%
+ 4704.29kB 69.64% 69.64%  4704.29kB 69.64%  internal/bytealg.MakeNoZero
+ -513.50kB  7.60% 62.04%  -513.50kB  7.60%  sync.(*Pool).pinSlow
+     513kB  7.59% 69.64%      513kB  7.59%  runtime.mallocgc
+  512.05kB  7.58% 77.22%   512.05kB  7.58%  net/http.(*persistConn).readLoop.func4
+  512.02kB  7.58% 84.80%   512.02kB  7.58%  net/textproto.NewReader (inline)
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/internal/filedesc.(*File).unmarshalSeed
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/internal/filedesc.Builder.Build
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/internal/filedesc.getBuilder (inline)
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/internal/filedesc.newRawFile
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/internal/filetype.Builder.Build
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/types/known/timestamppb.file_google_protobuf_timestamp_proto_init
+         0     0% 84.80%  -513.50kB  7.60%  google.golang.org/protobuf/types/known/timestamppb.init.0
+         0     0% 84.80%   512.05kB  7.58%  io.ReadAll
+         0     0% 84.80%  5216.34kB 77.22%  main.(*server).handlerRedirect
+         0     0% 84.80%   512.05kB  7.58%  main.checkDestination
+         0     0% 84.80%  5216.34kB 77.22%  main.newServer.metricsMiddleware.func10
+         0     0% 84.80%  5216.34kB 77.22%  main.newServer.newServer.requestLogger.func7.func8
+         0     0% 84.80%  5216.34kB 77.22%  main.newServer.requestIDMiddleware.func9
+         0     0% 84.80%  5216.34kB 77.22%  net/http.(*ServeMux).ServeHTTP
+         0     0% 84.80%   512.05kB  7.58%  net/http.(*bodyEOFSignal).Read
+         0     0% 84.80%   512.05kB  7.58%  net/http.(*bodyEOFSignal).condfn (inline)
+         0     0% 84.80%   512.02kB  7.58%  net/http.(*conn).readRequest
+         0     0% 84.80%  5728.36kB 84.80%  net/http.(*conn).serve
+         0     0% 84.80%  5216.34kB 77.22%  net/http.HandlerFunc.ServeHTTP
+         0     0% 84.80%   512.02kB  7.58%  net/http.newTextprotoReader
+         0     0% 84.80%   512.02kB  7.58%  net/http.readRequest
+         0     0% 84.80%  5216.34kB 77.22%  net/http.serverHandler.ServeHTTP
+         0     0% 84.80%      513kB  7.59%  runtime.allocm
+         0     0% 84.80%  -513.50kB  7.60%  runtime.doInit (inline)
+         0     0% 84.80%  -513.50kB  7.60%  runtime.doInit1
+         0     0% 84.80%  -513.50kB  7.60%  runtime.main
+         0     0% 84.80%      513kB  7.59%  runtime.mstart
+         0     0% 84.80%      513kB  7.59%  runtime.mstart0
+         0     0% 84.80%      513kB  7.59%  runtime.mstart1
+         0     0% 84.80%      513kB  7.59%  runtime.newm
+         0     0% 84.80%      513kB  7.59%  runtime.newobject
+         0     0% 84.80%      513kB  7.59%  runtime.schedule
+         0     0% 84.80%      513kB  7.59%  runtime.startm
+         0     0% 84.80%      513kB  7.59%  runtime.wakep
+         0     0% 84.80%  4704.29kB 69.64%  strings.(*Builder).Grow
+         0     0% 84.80%  4704.29kB 69.64%  strings.(*Builder).grow
+         0     0% 84.80%  4704.29kB 69.64%  strings.Repeat
+         0     0% 84.80%  -513.50kB  7.60%  sync.(*Pool).Get
+         0     0% 84.80%  -513.50kB  7.60%  sync.(*Pool).pin

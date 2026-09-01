@@ -31,7 +31,33 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
     "github.com/prometheus/client_golang/prometheus/promauto"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
+
 )
+
+var tracer trace.Tracer
+
+func initTracing(ctx context.Context) (func(context.Context) error, error) {
+    exp, err := otlptracegrpc.New(ctx)
+    if err != nil {
+        return nil, err
+    }
+
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exp,
+            sdktrace.WithBatchTimeout(2*time.Second),
+        ),
+        sdktrace.WithResource(resource.Default()),
+    )
+
+    otel.SetTracerProvider(tp)
+    tracer = tp.Tracer("boot.dev/linko")  // <-- package-level tracer
+    return tp.Shutdown, nil
+}
 
 var httpRequestsTotal = promauto.NewCounterVec(
     prometheus.CounterOpts{
@@ -236,6 +262,19 @@ func main() {
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
+
+    // Set up tracing
+    shutdownTracing, err := initTracing(context.Background())
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "failed to initialize tracing: %v\n", err)
+        return 1
+    }
+    defer func() {
+        if err := shutdownTracing(context.Background()); err != nil {
+            fmt.Fprintf(os.Stderr, "failed to shutdown tracing: %v\n", err)
+        }
+    }()
+
 	logger, closeLogger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)

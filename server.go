@@ -7,11 +7,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
+	
 
-	"boot.dev/linko/internal/store"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
+	"boot.dev/linko/internal/store"	
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type server struct {
@@ -36,14 +37,20 @@ func newServer(store store.Store, port int, cancel context.CancelFunc, logger *s
 	mux.Handle("GET /api/urls", s.authMiddleware(http.HandlerFunc(s.handlerListURLs)))
 	mux.HandleFunc("GET /{shortCode}", s.handlerRedirect)
 	mux.HandleFunc("POST /admin/shutdown", s.handlerShutdown)
+	mux.Handle("GET /debug/pprof/", s.authMiddleware(http.HandlerFunc(pprof.Index)))
+	mux.Handle("GET /debug/pprof/profile", s.authMiddleware(http.HandlerFunc(pprof.Profile)))
 
-    handler := metricsMiddleware(requestIDMiddleware(requestLogger(logger)(mux)))
+	// Wrap the mux with otelhttp to create root spans
+    tracedMux := otelhttp.NewHandler(mux, "http.server")
+
+    // Now apply your existing middlewares around tracedMux
+    handler := metricsMiddleware(requestIDMiddleware(requestLogger(logger)(tracedMux)))
+
+	
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 		Handler: handler,
 	}
-
-	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return s
 }
